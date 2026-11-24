@@ -1,7 +1,8 @@
 /**
- * أميرتي Cloud Panel — index.js (نسخة فائقة السرعة)
- * HTTP Server + Bot Manager + File Upload API
- * Node.js built-ins only
+ * لوحة أميرتي السحابية — Index.js
+ * خادم HTTP + مدير البوتات + واجهة برمجة تطبيقات تحميل الملفات
+ * وظائف Node.js المدمجة فقط (http، fs، path، child_process)
+ * لا توجد تبعيات خارجية باستثناء تحليل الملفات بدون استخدام multer
  */
 
 'use strict';
@@ -10,121 +11,63 @@ const http = require('http');
 const { spawn, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = process.env.PORT || 3000;
 const ADMIN_PASS = process.env.ADMIN_PASS || 'amirati2026';
-const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB
-const BOTS_DIR = path.resolve(__dirname, 'bots');
-const CLIENT_DIR = path.resolve(__dirname, '..', 'client');
+const BOTS_DIR = path.join(__dirname, 'bots');
+const CLIENT_DIR = path.join(__dirname, '..', 'client');
 
-if (!fs.existsSync(BOTS_DIR)) fs.mkdirSync(BOTS_DIR, { recursive: true });
+إذا لم يكن المجلد BOTS_DIR موجودًا في نظام الملفات (fs.existsSync)، فسيتم إنشاء المجلد BOTS_DIR باستخدام الدالة fs.mkdirSync مع تحديد خيار التكرار (recursive: true).
 
-// ── State ─────────────────────────────────────────────────────
+// ── الحالة ─────────────────────────────────────────────────────────────────
 let botProcess = null;
-let botStatus = 'stopped'; // stopped | starting | online | reconnecting
+let botStatus = 'stopped'; // متوقف | قيد التشغيل | متصل | إعادة الاتصال
 let pairingCode = '';
-let activeBot = null;
+let activeBot = null; // اسم ملف البوت الذي يعمل حاليًا
 let currentPhone = (process.env.BOT_PHONE || '').replace(/\D/g, '');
 const logs = [];
 
-// ── Caches for high speed ───────────────────────────────────
-let botsCache = { data: [], expiresAt: 0 };
-const staticCache = new Map(); // filePath -> { data, mime, etag }
-
-function invalidateBotsCache() {
-  botsCache.expiresAt = 0;
-}
-
-function getBotFiles() {
-  const now = Date.now();
-  if (now < botsCache.expiresAt) return botsCache.data;
-
-  const entries = fs.readdirSync(BOTS_DIR, { withFileTypes: true });
-  const list = [];
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    const full = path.join(BOTS_DIR, entry.name);
-    const stat = fs.statSync(full);
-    list.push({
-      name: entry.name,
-      size: stat.size,
-      ext: path.extname(entry.name),
-    });
-  }
-
-  botsCache = { data: list, expiresAt: now + 1500 };
-  return list;
-}
-
-// ── Helpers ───────────────────────────────────────────────────
-function isInsideDir(baseDir, targetPath) {
-  const resolvedBase = path.resolve(baseDir) + path.sep;
-  const resolvedTarget = path.resolve(targetPath);
-  return resolvedTarget.startsWith(resolvedBase);
-}
-
-function addLog(line, src = 'out') {
+// ── تسجيل الأحداث ────────────────────────────────────────────────────────────────
+دالة addLog(line, src = 'out') {
   const clean = String(line || '').trim();
-  if (!clean) return;
+  إذا لم يكن نظيفًا، فارجع؛
   const ts = Date.now();
   logs.push({ ts, src, text: clean });
-  if (logs.length > 400) logs.shift();
+  إذا كان طول السجل أكبر من 400، فسيتم إزاحة السجل.
   process.stdout.write(clean + '\n');
 
   const pairMatch = clean.match(/PAIRING CODE[:\s]+([A-Z0-9\-]{6,12})/i);
-  if (pairMatch) pairingCode = pairMatch[1];
-  if (clean.includes('[OK]') && clean.includes('ONLINE')) {
-    botStatus = 'online';
-    pairingCode = '';
-  }
-  if (clean.includes('[CLOSE]')) botStatus = 'reconnecting';
+  إذا كان (pairMatch) pairingCode = pairMatch[1];
+  إذا كان (clean.includes('[OK]') && clean.includes('ONLINE')) { botStatus = 'online'; pairingCode = ''; }
+  إذا كان (clean.includes('[CLOSE]')) botStatus = 'reconnecting';
 }
 
-// ── Bot runner ────────────────────────────────────────────────
-function getRunner(filename) {
+// ── بوت رانر ───────────────────────────────────────────────────────────
+دالة getRunner(filename) {
   const ext = path.extname(filename).toLowerCase();
-  const runners = {
-    '.js': ['node'],
-    '.py': ['python3', '-u'],
-    '.ts': ['ts-node'],
-    '.sh': ['bash'],
-  };
-  return runners[ext] || null;
+  return { '.js': ['node'], '.py': ['python3', '-u'], '.ts': ['ts-node'], '.sh': ['bash'] }[ext] || null;
 }
 
-function startBot(filename) {
-  if (!filename) return addLog('[ERR] لم يتم تحديد ملف بوت للتشغيل', 'err');
-  const safeName = path.basename(filename);
-  const filePath = path.join(BOTS_DIR, safeName);
+دالة بدء تشغيل البوت (اسم الملف) {
+  إذا (botProcess) أوقف البوت();
+  const filePath = path.join(BOTS_DIR, filename);
+  if (!fs.existsSync(filePath)) return addLog(`[ERR] الملف غير موجود: ${filename}`, 'err');
 
-  if (!isInsideDir(BOTS_DIR, filePath) || !fs.existsSync(filePath)) {
-    return addLog(`[ERR] الملف غير موجود: ${safeName}`, 'err');
-  }
-
-  const runner = getRunner(safeName);
-  if (!runner) return addLog(`[ERR] نوع الملف غير مدعوم: ${safeName}`, 'err');
-
-  if (botProcess) stopBot();
+  const runner = getRunner(filename);
+  if (!runner) return addLog(`[ERR] نوع الملف غير مدعوم: ${filename}`, 'err');
 
   botStatus = 'starting';
-  activeBot = safeName;
-  addLog(`[PANEL] تشغيل البوت: ${safeName}`, 'sys');
+  activeBot = filename;
+  addLog(`[PANEL] تشغيل البوت: ${filename}`);
 
   botProcess = spawn(runner[0], [...runner.slice(1), filePath], {
     cwd: BOTS_DIR,
-    env: { ...process.env, BOT_PHONE: currentPhone },
+    env: { ...process.env, BOT_PHONE: currentPhone }
   });
 
-  botProcess.stdout.on('data', (d) =>
-    d.toString().split('\n').forEach((l) => addLog(l, 'out'))
-  );
-  botProcess.stderr.on('data', (d) =>
-    d.toString().split('\n').forEach((l) => {
-      if (l.trim()) addLog(l, 'err');
-    })
-  );
-  botProcess.on('close', (code) => {
+  botProcess.stdout.on('data', d => d.toString().split('\n').forEach(l => addLog(l, 'out')));
+  botProcess.stderr.on('data', d => d.toString().split('\n').forEach(l => { if (l.trim()) addLog(l, 'err'); }));
+  botProcess.on('close', code => {
     addLog(`[PANEL] البوت توقف (exit ${code})`, 'sys');
     botProcess = null;
     botStatus = 'stopped';
@@ -132,326 +75,201 @@ function startBot(filename) {
   });
 }
 
-function stopBot() {
-  if (!botProcess) return;
-  const proc = botProcess;
+دالة stopBot() {
+  إذا لم تكن عملية البوت تعمل، فقم بالإرجاع؛
+  botProcess.kill('SIGTERM');
   botProcess = null;
   botStatus = 'stopped';
-  activeBot = null;
-
-  proc.kill('SIGTERM');
-  setTimeout(() => {
-    if (!proc.killed) {
-      try { proc.kill('SIGKILL'); } catch (_) {}
-    }
-  }, 1500);
-
   addLog('[PANEL] تم إيقاف البوت.', 'sys');
 }
 
-function restartBot() {
-  const files = getBotFiles();
-  const name = activeBot || (files[0] && files[0].name) || null;
+دالة restartBot() {
+  const name = activeBot || (fs.readdirSync(BOTS_DIR)[0] || null);
   stopBot();
-  if (name) setTimeout(() => startBot(name), 300);
+  إذا كان (الاسم) setTimeout(() => startBot(الاسم)، 1200)؛
 }
 
-function resetSession() {
+دالة resetSession() {
   stopBot();
   const authDir = path.join(BOTS_DIR, 'auth_info');
-  if (isInsideDir(BOTS_DIR, authDir)) {
-    fs.rmSync(authDir, { recursive: true, force: true });
-  }
+  fs.rmSync(authDir, { recursive: true, force: true });
   pairingCode = '';
-  addLog('[PANEL] تم حذف جلسة auth_info بنجاح.', 'sys');
+  addLog('[PANEL] تم حذف جلسة auth_info الفعالة.', 'sys');
 }
 
-// ── Multipart file parser (no deps) ──────────────────────────
-function parseMultipart(req, cb) {
+// ── محلل ملفات متعدد الأجزاء (بدون deps) ─────────────────────
+دالة parseMultipart(req, cb) {
   const ct = req.headers['content-type'] || '';
   const boundaryMatch = ct.match(/boundary=([^\s;]+)/);
-  if (!boundaryMatch) return cb(new Error('No boundary'));
-  const boundary = Buffer.from('--' + boundaryMatch[1]);
-  const nextBoundaryPattern = Buffer.concat([Buffer.from('\r\n'), boundary]);
+  إذا لم يكن هناك تطابق في الحدود، فسيتم إرجاع خطأ جديد ('لا يوجد حد').
+  const boundary = '--' + boundaryMatch[1];
 
-  let totalBytes = 0;
-  let aborted = false;
   const chunks = [];
-
-  req.on('data', (c) => {
-    if (aborted) return;
-    totalBytes += c.length;
-    if (totalBytes > MAX_UPLOAD_BYTES) {
-      aborted = true;
-      cb(new Error('File too large'));
-      req.destroy();
-      return;
-    }
-    chunks.push(c);
-  });
-
+  req.on('data', c => chunks.push(c));
   req.on('end', () => {
-    if (aborted) return;
     const buf = Buffer.concat(chunks);
     const files = [];
 
     let pos = 0;
-    while (pos < buf.length) {
+    بينما (الموضع < طول المخزن المؤقت) {
       const bStart = buf.indexOf(boundary, pos);
-      if (bStart === -1) break;
+      إذا كانت قيمة bStart تساوي -1، فاخرج من الحلقة.
       pos = bStart + boundary.length;
-      if (buf.slice(pos, pos + 2).toString() === '--') break;
-      pos += 2;
+      إذا كانت نتيجة عملية تقطيع المخزن المؤقت (buf.slice(pos, pos + 2).toString() === '--')، فاخرج من الحلقة.
+      pos += 2; // تخطي \r\n
 
       const headerEnd = buf.indexOf('\r\n\r\n', pos);
-      if (headerEnd === -1) break;
-      const headers = buf.slice(pos, headerEnd).toString('utf8');
+      إذا كانت قيمة (headerEnd) تساوي -1، فاخرج من الحلقة.
+      const headers = buf.slice(pos, headerEnd).toString();
       pos = headerEnd + 4;
 
       const nameMatch = headers.match(/name="([^"]+)"/);
       const filenameMatch = headers.match(/filename="([^"]+)"/);
-      if (!filenameMatch) {
-        pos++;
-        continue;
-      }
+      إذا لم يكن اسم الملف مطابقًا، فقم بزيادة الموضع بمقدار واحد، ثم انتقل إلى الخطوة التالية.
 
-      const nextBoundary = buf.indexOf(nextBoundaryPattern, pos);
-      if (nextBoundary === -1) break;
-
+      const nextBoundary = buf.indexOf('\r\n' + boundary, pos);
+      إذا كانت قيمة (nextBoundary) تساوي -1، فتوقف.
       const fileData = buf.slice(pos, nextBoundary);
-      files.push({
-        fieldname: nameMatch?.[1] || 'file',
-        filename: path.basename(filenameMatch[1]),
-        data: fileData,
-      });
+      files.push({ fieldname: nameMatch?.[1] || 'file', filename: path.basename(filenameMatch[1]), data: fileData });
       pos = nextBoundary + 2;
     }
     cb(null, files);
   });
-
-  req.on('error', (err) => {
-    if (!aborted) cb(err);
-  });
+  req.on('error', cb);
 }
 
-// ── Static & JSON helpers ─────────────────────────────────────
+// ── خدمة الملفات الثابتة ─────────────────────────────────────────
 const MIME = {
   '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css',
+  '.js': 'application/javascript',
   '.ico': 'image/x-icon',
   '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.svg': 'image/svg+xml',
-  '.json': 'application/json; charset=utf-8',
+  '.json': 'application/json',
 };
 
-function serveStatic(req, res, filePath) {
-  if (!isInsideDir(CLIENT_DIR, filePath)) {
-    res.writeHead(403);
-    return res.end('Forbidden');
-  }
-
-  const cached = staticCache.get(filePath);
-  if (cached) {
-    if (req.headers['if-none-match'] === cached.etag) {
-      res.writeHead(304);
-      return res.end();
-    }
-    res.writeHead(200, {
-      'Content-Type': cached.mime,
-      'Cache-Control': 'public, max-age=60',
-      'ETag': cached.etag,
-    });
-    return res.end(cached.data);
-  }
-
+دالة serveStatic(res, filePath) {
   fs.readFile(filePath, (err, data) => {
-    if (err) {
-      res.writeHead(404);
-      return res.end('Not found');
-    }
-    const ext = path.extname(filePath).toLowerCase();
-    const mime = MIME[ext] || 'application/octet-stream';
-    const etag = `"${crypto.createHash('md5').update(data).digest('hex')}"`;
-
-    staticCache.set(filePath, { data, mime, etag });
-
-    res.writeHead(200, {
-      'Content-Type': mime,
-      'Cache-Control': 'public, max-age=60',
-      'ETag': etag,
-    });
+    إذا حدث خطأ، فسيتم كتابة رمز الاستجابة 404، وسيتم إرجاع رسالة "غير موجود".
+    const ext = path.extname(filePath);
+    res.writeHead(200, { 'Content-Type': MIME[ext] || 'text/plain' });
     res.end(data);
   });
 }
 
-function json(res, code, obj) {
-  const payload = Buffer.from(JSON.stringify(obj), 'utf8');
-  res.writeHead(code, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': payload.length,
-  });
-  res.end(payload);
+// ── أدوات مساعدة JSON ──────────────────────────────────────────────────────
+دالة json(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(obj));
 }
 
-function readBody(req, cb) {
-  const chunks = [];
-  let size = 0;
-  req.on('data', (c) => {
-    size += c.length;
-    if (size > 1024 * 1024) {
-      req.destroy();
-      return cb(new Error('Body too large'));
-    }
-    chunks.push(c);
-  });
-  req.on('end', () => {
-    try {
-      const raw = Buffer.concat(chunks).toString('utf8');
-      cb(null, JSON.parse(raw || '{}'));
-    } catch (e) {
-      cb(e);
-    }
-  });
+دالة قراءة نص الطلب (req, cb) {
+  let b = '';
+  req.on('data', c => b += c);
+  req.on('end', () => { try { cb(null, JSON.parse(b || '{}')); } catch (e) { cb(e); } });
 }
 
-// ── HTTP Server ───────────────────────────────────────────────
+// ── خادم HTTP ──────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-admin-pass');
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    return res.end();
-  }
-
-  const qIdx = req.url.indexOf('?');
-  const url = qIdx === -1 ? req.url : req.url.slice(0, qIdx);
-  const rawQuery = qIdx === -1 ? '' : req.url.slice(qIdx + 1);
+  const url = req.url.split('?')[0];
   const method = req.method;
 
-  if (method === 'GET' && url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end('OK');
+  // ── فحص صحي
+  إذا كانت (الطريقة === 'GET' && عنوان URL === '/health') {
+    res.writeHead(200); return res.end('OK');
   }
 
-  if (method === 'GET' && url === '/api/state') {
-    const sinceParam = new URLSearchParams(rawQuery).get('since');
-    const since = sinceParam ? (parseInt(sinceParam, 10) || 0) : 0;
-    const bots = getBotFiles();
-    const filteredLogs = since > 0 ? logs.filter((l) => l.ts > since) : logs;
-
+  // ── واجهة برمجة التطبيقات: الحالة
+  إذا كانت (الطريقة === 'GET' && عنوان URL === '/api/state') {
+    const since = parseInt(new URLSearchParams(req.url.split('?')[1] || '').get('since') || '0', 10);
+    const bots = fs.readdirSync(BOTS_DIR)
+      .filter(f => !fs.statSync(path.join(BOTS_DIR, f)).isDirectory())
+      .map(f => ({ name: f, size: fs.statSync(path.join(BOTS_DIR, f)).size, ext: path.extname(f) }));
     return json(res, 200, {
-      status: botStatus,
+      الحالة: botStatus,
       pairingCode,
       phone: currentPhone,
       activeBot,
-      bots,
-      logs: filteredLogs,
+      روبوتات،
+      السجلات: logs.filter(l => l.ts > since),
     });
   }
 
-  if (method === 'POST' && url === '/api/upload') {
+  // ── واجهة برمجة التطبيقات: تحميل ملف البوت
+  إذا كانت طريقة الإرسال هي POST وكان عنوان URL هو /api/upload،
     parseMultipart(req, (err, files) => {
-      if (err) {
-        return json(res, 400, { ok: false, error: err.message || 'فشل تحليل الملفات' });
-      }
-      if (!files.length) {
-        return json(res, 400, { ok: false, error: 'لا توجد ملفات صالحة' });
-      }
+      if (err || !files.length) return json(res, 400, { ok: false, error: 'لا توجد ملفات صالحة' });
       const allowed = ['.py', '.js', '.ts', '.sh'];
       const saved = [];
       for (const f of files) {
-        const safeName = path.basename(f.filename);
-        const targetPath = path.join(BOTS_DIR, safeName);
-        const ext = path.extname(safeName).toLowerCase();
-        if (!allowed.includes(ext) || !isInsideDir(BOTS_DIR, targetPath)) continue;
-        fs.writeFileSync(targetPath, f.data);
-        saved.push(safeName);
-        addLog(`[UPLOAD] تم رفع الملف: ${safeName}`, 'sys');
+        const ext = path.extname(f.filename).toLowerCase();
+        إذا لم يكن مسموحًا به، فتابع
+        fs.writeFileSync(path.join(BOTS_DIR, f.filename), f.data);
+        saved.push(f.filename);
+        addLog(`[UPLOAD] تم رفع الملف: ${f.filename}`, 'sys');
       }
-      if (saved.length) invalidateBotsCache();
-      if (!saved.length) {
-        return json(res, 400, { ok: false, error: 'نوع الملف غير مدعوم' });
-      }
+      if (!saved.length) return json(res, 400, { ok: false, error: 'نوع الملف غير مدعوم' });
       json(res, 200, { ok: true, uploaded: saved });
     });
-    return;
+    إرجاع؛
   }
 
-  if (method === 'DELETE' && url.startsWith('/api/bots/')) {
-    const name = path.basename(decodeURIComponent(url.replace('/api/bots/', '')));
+  // ── واجهة برمجة التطبيقات: حذف ملف البوت
+  إذا كانت طريقة التنفيذ هي "حذف" وكان عنوان URL يبدأ بـ "/api/bots/" {
+    const name = decodeURIComponent(url.replace('/api/bots/', ''));
     const fp = path.join(BOTS_DIR, name);
-    if (!isInsideDir(BOTS_DIR, fp) || !fs.existsSync(fp)) {
-      return json(res, 404, { ok: false, error: 'الملف غير موجود' });
-    }
-    if (activeBot === name) stopBot();
+    if (!fs.existsSync(fp)) return json(res, 404, { ok: false, error: 'الملف غير موجود' });
+    إذا كان (activeBot === name) أوقف البوت();
     fs.unlinkSync(fp);
-    invalidateBotsCache();
     addLog(`[PANEL] تم حذف الملف: ${name}`, 'sys');
     return json(res, 200, { ok: true });
   }
 
-  if (method === 'POST' && url === '/api/action') {
+  // ── واجهة برمجة التطبيقات: الإجراءات (بدء/إيقاف/إعادة تشغيل/إعادة ضبط/تنفيذ/ضبط الهاتف)
+  إذا كانت طريقة الإرسال هي POST وكان عنوان URL هو '/api/action' {
     readBody(req, (err, body) => {
       if (err) return json(res, 400, { ok: false, error: 'JSON غير صالح' });
-      if (body.pass !== ADMIN_PASS) {
-        return json(res, 403, { ok: false, error: 'كلمة المرور غير صحيحة' });
-      }
+      if (body.pass !== ADMIN_PASS) return json(res, 403, { ok: false, error: 'كلمة المرور غير صحيحة' });
 
       switch (body.action) {
-        case 'start': {
-          const files = getBotFiles();
-          startBot(body.bot || (files[0] && files[0].name));
-          break;
-        }
-        case 'stop':
-          stopBot();
-          break;
-        case 'restart':
-          restartBot();
-          break;
-        case 'reset':
-          resetSession();
-          break;
-        case 'set_phone':
+        حالة 'start':
+          startBot(body.bot || fs.readdirSync(BOTS_DIR).filter(f => !fs.statSync(path.join(BOTS_DIR,f)).isDirectory())[0]);
+          فاصل؛
+        في حالة 'إيقاف': أوقف الروبوت(); توقف؛
+        في حالة 'إعادة التشغيل': أعد تشغيل البوت(); توقف؛
+        في حالة 'reset': أعد ضبط الجلسة(); توقف؛
+        حالة 'set_phone':
           currentPhone = String(body.phone || '').replace(/\D/g, '');
           addLog(`[PANEL] رقم الواتساب: ${currentPhone}`, 'sys');
-          break;
-        case 'exec':
-          if (body.cmd) {
+          فاصل؛
+        حالة 'exec':
+          إذا كان (body.cmd) {
             addLog(`$ ${body.cmd}`, 'sys');
             exec(body.cmd, { cwd: BOTS_DIR, timeout: 15000 }, (e, out, err2) => {
-              if (out) out.split('\n').forEach((l) => addLog(l, 'out'));
-              if (err2) err2.split('\n').forEach((l) => {
-                if (l.trim()) addLog(l, 'err');
-              });
-              if (e && !err2) addLog(`[ERR] ${e.message}`, 'err');
-              invalidateBotsCache();
+              إذا كان (out) out.split('\n').forEach(l => addLog(l, 'out'));
+              إذا كان (err2) err2.split('\n').forEach(l => { if (l.trim()) addLog(l, 'err'); });
+              إذا كان (e && !err2) أضف سجل(`[ERR] ${e.message}`, 'err');
             });
           }
-          break;
-        default:
-          return json(res, 400, { ok: false, error: 'إجراء غير معروف' });
+          فاصل؛
       }
       json(res, 200, { ok: true });
     });
-    return;
+    إرجاع؛
   }
 
-  if (method === 'GET') {
-    const filePath = url === '/' ? path.join(CLIENT_DIR, 'index.html') : path.join(CLIENT_DIR, url);
-    serveStatic(req, res, filePath);
-    return;
+  // ── ملفات ثابتة
+  إذا كانت (الطريقة === 'GET') {
+    let filePath = url === '/' ? '/index.html' : url;
+    serveStatic(res, path.join(CLIENT_DIR, filePath));
+    إرجاع؛
   }
 
-  res.writeHead(404);
-  res.end('Not found');
+  res.writeHead(404); res.end('غير موجود');
 });
 
 server.listen(PORT, () => {
-  addLog(`[SERVER] أميرتي Cloud Panel يعمل على المنفذ ${PORT}`, 'sys');
+  addLog(`[SERVER] أميرتي Cloud Panel تعمل على المنفذ ${PORT}`, 'sys');
 });
