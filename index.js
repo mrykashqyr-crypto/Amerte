@@ -15,7 +15,9 @@ const path     = require('path');
 const PORT       = process.env.PORT || 3000;
 const ADMIN_PASS = process.env.ADMIN_PASS || 'amirati2026';
 const BOTS_DIR   = path.join(__dirname, 'bots');
-const CLIENT_DIR = path.join(__dirname, '..', 'client');
+const CLIENT_DIR = fs.existsSync(path.join(__dirname, 'client', 'index.html'))
+  ? path.join(__dirname, 'client')
+  : __dirname;
 
 if (!fs.existsSync(BOTS_DIR)) fs.mkdirSync(BOTS_DIR, { recursive: true });
 
@@ -273,3 +275,4 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   addLog(`[SERVER] أميرتي Cloud Panel يعمل على المنفذ ${PORT}`, 'sys');
 });
+                      
