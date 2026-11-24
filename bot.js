@@ -1,7 +1,6 @@
 /**
  * أميرتي WhatsApp Bot — bot.js
- * يعمل مع Baileys + AI من pollinations.ai مجاناً
- * ضعه في مجلد bots/ وشغّله من لوحة التحكم
+ * يعمل مع Baileys + Google Gemini API
  */
 
 'use strict';
@@ -15,8 +14,23 @@ const {
 const pino = require('pino');
 const fs   = require('fs');
 const path = require('path');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const AUTH_DIR = path.join(__dirname, 'auth_info');
+
+// ── إعدادات Gemini ──────────────────────────────────────────
+// يتم سحب المفتاح من متغيرات البيئة في Render أو الخادم
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || ''; 
+let genAI = null;
+let model = null;
+
+if (GEMINI_API_KEY) {
+  genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  model = genAI.getGenerativeModel({ 
+    model: "gemini-1.5-flash",
+    systemInstruction: "أنت 'أميرتي'، مساعدة ذكاء اصطناعي ذكية ومشرفة على مجموعة واتساب. ردودك يجب أن تكون مختصرة، مفيدة، وبطابع ودود ومحترم. لا تذكر أي أعذار تقنية أو أخطاء برمجية أبداً."
+  });
+}
 
 // ── إخفاء الضجيج التقني ──────────────────────────────────────
 const origLog = console.log.bind(console);
@@ -36,40 +50,8 @@ let pairingInProgress = false;
 let reconnectTimer    = null;
 let reconnectCount    = 0;
 
-const chatMemory      = new Map();
+const chatMemory      = new Map(); // لحفظ سياق المحادثة
 const processedIds    = new Set();
-
-// ── AI ────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `أنت "أميرتي"، مساعدة ذكاء اصطناعي ذكية ومشرفة على واتساب.
-- تفاعلي بذكاء واختصار مفيد مع اسم المتحدث.
-- لا تذكري أعذاراً تقنية أو حالة الشبكة أبداً.`.trim();
-
-async function askAI(jid, speaker, prompt) {
-  if (!chatMemory.has(jid)) chatMemory.set(jid, []);
-  const history = chatMemory.get(jid);
-  history.push({ role: 'user', speaker, text: prompt.slice(0, 320) });
-  if (history.length > 8) history.shift();
-
-  const transcript = history.map(m =>
-    `${m.role === 'user' ? m.speaker : 'أميرتي'}: ${m.text}`).join('\n');
-  const fullPrompt = `${SYSTEM_PROMPT}\n\n--- المحادثة ---\n${transcript}\n\nردي بصفتك أميرتي على (${speaker}):`;
-
-  for (let i = 1; i <= 3; i++) {
-    const ctrl  = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), i === 1 ? 18000 : 28000);
-    try {
-      const res = await fetch(`https://text.pollinations.ai/${encodeURIComponent(fullPrompt)}`, { signal: ctrl.signal });
-      clearTimeout(timer);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const reply = (await res.text()).trim();
-      if (reply) {
-        history.push({ role: 'assistant', speaker: 'أميرتي', text: reply.slice(0, 320) });
-        return reply;
-      }
-    } catch { clearTimeout(timer); await new Promise(r => setTimeout(r, 1500 * i)); }
-  }
-  throw new Error('AI exhausted');
-}
 
 // ── Reconnect ─────────────────────────────────────────────────
 function scheduleReconnect(delayMs) {
@@ -157,31 +139,49 @@ async function boot() {
         if (!body) return;
 
         const pushName = msg.pushName || 'مجهول';
-        const isMe     = msg.key.fromMe;
-        if (isMe) return;
+        if (msg.key.fromMe) return;
 
+        // التحقق مما إذا كان البوت مطلوباً في المجموعات
         const mentionsMe = body.toLowerCase().includes('أميرتي') || body.toLowerCase().includes('bot');
-
         if (isGroup && !mentionsMe) return;
 
         origLog(`[MSG] ${pushName}: ${body}`);
-
-        // أوامر خاصة
         const cmd = body.replace(/أميرتي\s*/i, '').trim().toLowerCase();
 
-        if (cmd === 'انسى') {
+        // أمر مسح الذاكرة
+        if (cmd === 'انسى' || cmd === 'انسى كل شي') {
           chatMemory.delete(jid);
           await sock.sendMessage(jid, { text: '🧠 تم مسح الذاكرة، نبدأ من جديد!' }, { quoted: msg });
           return;
         }
 
-        // رد AI
+        // الرد باستخدام Gemini
+        if (!model) {
+           origLog("[ERR] GEMINI_API_KEY غير موجود في متغيرات البيئة!");
+           return;
+        }
+
         try {
-          const reply = await askAI(jid, pushName, body);
+          // تجهيز سياق المحادثة
+          if (!chatMemory.has(jid)) chatMemory.set(jid, []);
+          const history = chatMemory.get(jid);
+          history.push({ role: 'user', parts: [{ text: `${pushName}: ${body}` }] });
+          if (history.length > 10) history.shift(); // الاحتفاظ بآخر 10 رسائل فقط
+
+          const chat = model.startChat({ history });
+          const result = await chat.sendMessage(body);
+          const reply = result.response.text().trim();
+
+          // حفظ رد البوت في الذاكرة
+          history.push({ role: 'model', parts: [{ text: reply }] });
+          if (history.length > 10) history.shift();
+
           await sock.sendMessage(jid, { text: reply }, { quoted: msg });
           origLog(`[SENT] رد على ${pushName}`);
-        } catch {
-          // صمت تام — بدون أعذار
+
+        } catch (e) {
+          origLog('[ERR] Gemini Error: ' + e.message);
+          // في حال فشل Gemini (مثلاً انتهت الحصة اليومية)، نرسل رسالة صامتة أو نتجاهل
         }
       } catch (e) {
         origLog('[ERR] messages.upsert: ' + e.message);
