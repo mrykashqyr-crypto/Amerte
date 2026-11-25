@@ -1,6 +1,6 @@
 /**
  * أميرتي WhatsApp Bot — bot.js
- * يعمل مع Baileys + Google Gemini API
+ * نسخة مخصصة: حل مشكلة الربط + دعم Gemini
  */
 
 'use strict';
@@ -8,7 +8,8 @@
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  fetchLatestBaileysVersion,
+  fetchLatestWaWebVersion, // ← مهم جداً لحل مشكلة الربط
+  Browsers,                // ← مهم جداً: تسمية متصفح رسمية
   DisconnectReason,
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
@@ -18,18 +19,19 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const AUTH_DIR = path.join(__dirname, 'auth_info');
 
-// ── إعدادات Gemini ──────────────────────────────────────────
-// يتم سحب المفتاح من متغيرات البيئة في Render أو الخادم
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || ''; 
-let genAI = null;
+// ── تهيئة Gemini ─────────────────────────────────────────────
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 let model = null;
 
 if (GEMINI_API_KEY) {
-  genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-  model = genAI.getGenerativeModel({ 
+  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  model = genAI.getGenerativeModel({
     model: "gemini-1.5-flash",
-    systemInstruction: "أنت 'أميرتي'، مساعدة ذكاء اصطناعي ذكية ومشرفة على مجموعة واتساب. ردودك يجب أن تكون مختصرة، مفيدة، وبطابع ودود ومحترم. لا تذكر أي أعذار تقنية أو أخطاء برمجية أبداً."
+    systemInstruction: `أنت "أميرتي"، مساعدة ذكاء اصطناعي شخصية. ردودك ودية ومختصرة. لا تذكر أنك نموذج ذكاء اصطناعي، أنت "أميرتي" فقط.`
   });
+  console.log('[OK] تم تهيئة Gemini بنجاح');
+} else {
+  console.log('[ERR] تحذير: GEMINI_API_KEY غير موجود! البوت لن يرد.');
 }
 
 // ── إخفاء الضجيج التقني ──────────────────────────────────────
@@ -50,34 +52,67 @@ let pairingInProgress = false;
 let reconnectTimer    = null;
 let reconnectCount    = 0;
 
-const chatMemory      = new Map(); // لحفظ سياق المحادثة
-const processedIds    = new Set();
+const chatMemory   = new Map();
+const processedIds = new Set();
 
-// ── Reconnect ─────────────────────────────────────────────────
+// ── إعادة الاتصال ─────────────────────────────────────────────
 function scheduleReconnect(delayMs) {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectCount++;
-  const wait = delayMs ?? Math.min(7000 * reconnectCount, 35000);
+  const wait = delayMs ?? Math.min(5000 * reconnectCount, 30000);
   origLog(`[NET] إعادة الاتصال خلال ${Math.round(wait / 1000)}s...`);
   reconnectTimer = setTimeout(boot, wait);
 }
 
-// ── Boot ──────────────────────────────────────────────────────
+// ── رد Gemini ─────────────────────────────────────────────────
+async function getGeminiReply(jid, pushName, text) {
+  if (!model) return null;
+  if (!chatMemory.has(jid)) chatMemory.set(jid, []);
+  const history = chatMemory.get(jid);
+  history.push({ role: 'user', parts: [{ text: `${pushName}: ${text}` }] });
+  if (history.length > 6) history.shift();
+
+  try {
+    const chat = model.startChat({ history });
+    const result = await chat.sendMessage(text);
+    const reply = result.response.text().trim();
+    if (reply) {
+      history.push({ role: 'model', parts: [{ text: reply }] });
+      if (history.length > 6) history.shift();
+      return reply;
+    }
+    return null;
+  } catch (e) {
+    origLog('[ERR] Gemini: ' + e.message);
+    return null;
+  }
+}
+
+// ── التشغيل ───────────────────────────────────────────────────
 async function boot() {
   if (isStarting) return;
   isStarting = true;
+  
   try {
     if (activeSock) { try { activeSock.end(undefined); } catch {} activeSock = null; }
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    
+    // ← التعديل الأهم: جلب أحدث نسخة من واتساب ويب
     let version = [2, 3000, 1015901307];
-    try { const r = await fetchLatestBaileysVersion(); version = r.version; } catch {}
+    try { 
+      const r = await fetchLatestWaWebVersion(); 
+      version = r.version; 
+      origLog(`[VERSION] نسخة واتساب: ${version.join('.')}`);
+    } catch (e) {
+      origLog('[WARN] فشل جلب النسخة، استخدام الافتراضية');
+    }
 
     const sock = makeWASocket({
       version,
       auth: state,
       logger: pino({ level: 'silent' }),
-      browser: ['Ubuntu', 'Chrome', '22.04.4'],
+      browser: Browsers.macOS("Chrome"), // ← التعديل الأهم: تسمية رسمية
       syncFullHistory: false,
       markOnlineOnConnect: false,
       connectTimeoutMs: 120000,
@@ -93,7 +128,7 @@ async function boot() {
         pairingInProgress = true;
         try {
           if (!phoneNumber) { origLog('[ERR] لم يتم تحديد رقم الواتساب'); return; }
-          await new Promise(r => setTimeout(r, 4500));
+          await new Promise(r => setTimeout(r, 4000));
           const code = await sock.requestPairingCode(phoneNumber);
           origLog('PAIRING CODE: ' + code);
         } catch (e) {
@@ -117,16 +152,19 @@ async function boot() {
       }
     });
 
-    // ── Messages ──────────────────────────────────────────────
+    // ── استقبال الرسائل ───────────────────────────────────────
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       try {
         if (type !== 'notify' && type !== 'append') return;
         const msg = messages?.[0];
         if (!msg?.message || processedIds.has(msg.key?.id)) return;
         processedIds.add(msg.key?.id);
-        if (processedIds.size > 500) { const it = processedIds.values(); it.next(); processedIds.delete(it.next().value); }
+        if (processedIds.size > 500) { 
+          const it = processedIds.values(); 
+          it.next(); processedIds.delete(it.next().value); 
+        }
 
-        const jid     = msg.key.remoteJid;
+        const jid = msg.key.remoteJid;
         if (!jid || jid === 'status@broadcast') return;
         const isGroup = jid.endsWith('@g.us');
 
@@ -137,52 +175,34 @@ async function boot() {
           '';
 
         if (!body) return;
-
         const pushName = msg.pushName || 'مجهول';
         if (msg.key.fromMe) return;
 
-        // التحقق مما إذا كان البوت مطلوباً في المجموعات
-        const mentionsMe = body.toLowerCase().includes('أميرتي') || body.toLowerCase().includes('bot');
+        const lowerBody = body.toLowerCase();
+        const mentionsMe = lowerBody.includes('أميرتي') || 
+                           lowerBody.includes('اميرتي') || 
+                           lowerBody.includes('bot');
+        
         if (isGroup && !mentionsMe) return;
 
         origLog(`[MSG] ${pushName}: ${body}`);
+        
         const cmd = body.replace(/أميرتي\s*/i, '').trim().toLowerCase();
 
-        // أمر مسح الذاكرة
         if (cmd === 'انسى' || cmd === 'انسى كل شي') {
           chatMemory.delete(jid);
           await sock.sendMessage(jid, { text: '🧠 تم مسح الذاكرة، نبدأ من جديد!' }, { quoted: msg });
           return;
         }
 
-        // الرد باستخدام Gemini
-        if (!model) {
-           origLog("[ERR] GEMINI_API_KEY غير موجود في متغيرات البيئة!");
-           return;
+        if (model) {
+          const reply = await getGeminiReply(jid, pushName, body);
+          if (reply) {
+            await sock.sendMessage(jid, { text: reply }, { quoted: msg });
+            origLog(`[SENT] رد على ${pushName}`);
+          }
         }
 
-        try {
-          // تجهيز سياق المحادثة
-          if (!chatMemory.has(jid)) chatMemory.set(jid, []);
-          const history = chatMemory.get(jid);
-          history.push({ role: 'user', parts: [{ text: `${pushName}: ${body}` }] });
-          if (history.length > 10) history.shift(); // الاحتفاظ بآخر 10 رسائل فقط
-
-          const chat = model.startChat({ history });
-          const result = await chat.sendMessage(body);
-          const reply = result.response.text().trim();
-
-          // حفظ رد البوت في الذاكرة
-          history.push({ role: 'model', parts: [{ text: reply }] });
-          if (history.length > 10) history.shift();
-
-          await sock.sendMessage(jid, { text: reply }, { quoted: msg });
-          origLog(`[SENT] رد على ${pushName}`);
-
-        } catch (e) {
-          origLog('[ERR] Gemini Error: ' + e.message);
-          // في حال فشل Gemini (مثلاً انتهت الحصة اليومية)، نرسل رسالة صامتة أو نتجاهل
-        }
       } catch (e) {
         origLog('[ERR] messages.upsert: ' + e.message);
       }
